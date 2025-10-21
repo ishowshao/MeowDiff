@@ -109,6 +109,24 @@ impl StorageEngine {
         self.update_registry()
     }
 
+    pub fn has_snapshots(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT 1 FROM latest_snapshots LIMIT 1")?;
+        Ok(stmt.exists([])?)
+    }
+
+    pub fn seed_snapshot(&self, path: &str, data: &[u8]) -> Result<()> {
+        let sha = util::hash_bytes(data);
+        self.ensure_blob(&sha, Some(data))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO latest_snapshots (path, sha, record_id, updated_at) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(path) DO UPDATE SET sha=excluded.sha, record_id=excluded.record_id, updated_at=excluded.updated_at",
+            params![path, sha, "baseline", Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
     pub fn commit_record(
         &self,
         meta: &RecordMeta,
@@ -137,12 +155,12 @@ impl StorageEngine {
         for artifact in artifacts {
             if let Some(ref before_blob) = artifact.before_blob {
                 if let Some(ref sha) = artifact.record.before_sha {
-                    self.ensure_blob(sha, Some(before_blob))?;
+                    self.ensure_blob(sha, Some(before_blob.as_slice()))?;
                 }
             }
             if let Some(ref after_blob) = artifact.after_blob {
                 if let Some(ref sha) = artifact.record.after_sha {
-                    self.ensure_blob(sha, Some(after_blob))?;
+                    self.ensure_blob(sha, Some(after_blob.as_slice()))?;
                 }
             }
         }
@@ -286,7 +304,7 @@ impl StorageEngine {
         Ok(buf)
     }
 
-    pub fn ensure_blob(&self, sha: &str, content: Option<&Vec<u8>>) -> Result<()> {
+    pub fn ensure_blob(&self, sha: &str, content: Option<&[u8]>) -> Result<()> {
         let path = self.blob_path(sha);
         if path.exists() {
             return Ok(());

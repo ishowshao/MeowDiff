@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use directories::BaseDirs;
+use nu_ansi_term::Color;
 
 pub fn resolve_project_root(path: Option<PathBuf>) -> Result<PathBuf> {
     let path = match path {
@@ -64,4 +65,23 @@ pub fn relative_path(project_root: &Path, path: &Path) -> Option<String> {
 
 pub fn tool_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+pub fn colorize_patch(patch: &str) -> String {
+    let mut result = String::with_capacity(patch.len() + patch.len() / 10);
+    let lines: Vec<&str> = patch.lines().collect();
+    for (idx, &line) in lines.iter().enumerate() {
+        let colored = if line.starts_with('+') && !line.starts_with("+++") {
+            Color::Green.paint(line).to_string()
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Color::Red.paint(line).to_string()
+        } else {
+            line.to_string()
+        };
+        result.push_str(&colored);
+        if idx != lines.len() - 1 || patch.ends_with('\n') {
+            result.push('\n');
+        }
+    }
+    result
 }

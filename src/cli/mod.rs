@@ -13,7 +13,7 @@ use crate::models::TimelineEntry;
 use crate::pipeline::decompress_patch;
 use crate::runtime;
 use crate::storage::{find_project_entry, read_registry_global, StorageEngine};
-use crate::util;
+use crate::util::{self, colorize_patch};
 use crate::watcher::{self, is_process_alive, send_terminate, WatchLock, WatchOptions};
 
 #[derive(Parser)]
@@ -314,7 +314,7 @@ fn handle_diff(args: DiffArgs) -> Result<()> {
         }
     }
 
-    println!("{}", patch);
+    print!("{}", colorize_patch(&patch));
     Ok(())
 }
 
@@ -622,9 +622,13 @@ fn print_timeline(entries: &[TimelineEntry]) {
 fn filter_patch_for_file(patch: &str, file: &str) -> String {
     let needle_a = format!("a/{file}");
     let needle_b = format!("b/{file}");
-    patch
+    let mut filtered = patch
         .split("\n\n")
         .filter(|section| section.contains(&needle_a) || section.contains(&needle_b))
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    if patch.ends_with('\n') && !filtered.is_empty() && !filtered.ends_with('\n') {
+        filtered.push('\n');
+    }
+    filtered
 }

@@ -16,6 +16,7 @@ use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watc
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
+use walkdir::WalkDir;
 
 use crate::ignore::IgnoreMatcher;
 use crate::models::{FileRecord, RecordMeta};
@@ -23,7 +24,7 @@ use crate::pipeline::{
     aggregate_stats, build_file_artifact, compress_patch, FileArtifact, FileInput,
 };
 use crate::storage::StorageEngine;
-use crate::util;
+use crate::util::{self, colorize_patch};
 
 const DEFAULT_WINDOW_MS: u64 = 50;
 
@@ -48,6 +49,11 @@ pub async fn watch(options: WatchOptions) -> Result<()> {
 
     let meta_dir = storage.paths().meta_dir.clone();
     let lock = WatchLock::acquire(&meta_dir, storage.project_id())?;
+
+    if !storage.has_snapshots()? {
+        tracing::info!("priming baseline snapshots");
+        prime_baseline(&project_root, &storage, &ignore)?;
+    }
 
     let (tx, mut rx) = mpsc::channel::<Event>(1024);
     let mut watcher = create_watcher(tx)?;
@@ -169,18 +175,19 @@ fn process_batch(
         patch.push('\n');
     }
 
+    let compressed_patch = compress_patch(&patch)?;
+    storage.commit_record(&meta, &compressed_patch, &artifacts)?;
+    storage.register_touch()?;
+    tracing::info!(record_id = %meta.record_id, files = meta.files.len(), "recorded batch");
+
     if !patch.trim().is_empty() {
         println!(
             "record {} (files: {}, +{}, -{})",
             record_id, meta.stats.files, meta.stats.lines_added, meta.stats.lines_removed
         );
-        print!("{}", patch);
+        let colored = colorize_patch(&patch);
+        print!("{}\n\n", colored);
     }
-
-    let compressed_patch = compress_patch(&patch)?;
-    storage.commit_record(&meta, &compressed_patch, &artifacts)?;
-    storage.register_touch()?;
-    tracing::info!(record_id = %meta.record_id, files = meta.files.len(), "recorded batch");
     Ok(())
 }
 
@@ -250,4 +257,25 @@ fn generate_record_id(project_id: &str, started_at: DateTime<Utc>, files: &[File
     let hash = hasher.finalize();
     let encoded = hex::encode(hash.as_bytes());
     encoded.chars().take(12).collect()
+}
+
+fn prime_baseline(project_root: &Path, storage: &StorageEngine, ignore: &IgnoreMatcher) -> Result<()> {
+    let mut count = 0usize;
+    for entry in WalkDir::new(project_root).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if ignore.is_ignored(path, false) {
+            continue;
+        }
+        if let Some(rel) = util::relative_path(project_root, path) {
+            let data = fs::read(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            storage.seed_snapshot(&rel, &data)?;
+            count += 1;
+        }
+    }
+    tracing::info!(files = count, "baseline snapshots prepared");
+    Ok(())
 }

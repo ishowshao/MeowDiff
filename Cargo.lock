@@ -638,6 +638,7 @@ dependencies = [
  "ignore",
  "libc",
  "notify",
+ "nu-ansi-term",
  "predicates",
  "rusqlite",
  "serde",
@@ -647,6 +648,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
  "zstd",
 ]
 
