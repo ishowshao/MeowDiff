@@ -636,6 +636,7 @@ dependencies = [
  "directories",
  "hex",
  "ignore",
+ "libc",
  "notify",
  "predicates",
  "rusqlite",

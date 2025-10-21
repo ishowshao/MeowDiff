@@ -1,4 +1,6 @@
+mod lock;
 mod microbatch;
+pub use lock::{is_process_alive, send_terminate, LockInfo, WatchLock};
 pub use microbatch::Batch;
 
 use std::collections::BTreeSet;
@@ -11,6 +13,8 @@ use anyhow::{Context, Result};
 use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
 use crate::ignore::IgnoreMatcher;
@@ -42,6 +46,9 @@ pub async fn watch(options: WatchOptions) -> Result<()> {
     let storage = Arc::new(StorageEngine::open(&project_root)?);
     let ignore = Arc::new(IgnoreMatcher::new(&project_root)?);
 
+    let meta_dir = storage.paths().meta_dir.clone();
+    let lock = WatchLock::acquire(&meta_dir, storage.project_id())?;
+
     let (tx, mut rx) = mpsc::channel::<Event>(1024);
     let mut watcher = create_watcher(tx)?;
     watcher
@@ -54,25 +61,58 @@ pub async fn watch(options: WatchOptions) -> Result<()> {
         "watcher started"
     );
 
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
-    loop {
-        tokio::select! {
-            _ = &mut ctrl_c => {
-                tracing::info!("ctrl-c received, shutting down watcher");
-                break;
-            }
-            batch = microbatch::next_batch(&mut rx, options.window) => {
-                match batch {
-                    Some(batch) => {
-                        if let Err(err) = process_batch(batch, project_root.clone(), storage.clone(), ignore.clone()) {
-                            tracing::error!(error = %err, "failed to process batch");
+    #[cfg(unix)]
+    {
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        let mut sigterm_stream =
+            signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+        loop {
+            tokio::select! {
+                _ = &mut ctrl_c => {
+                    tracing::info!("SIGINT received, shutting down watcher");
+                    break;
+                }
+                _ = sigterm_stream.recv() => {
+                    tracing::info!("SIGTERM received, shutting down watcher");
+                    break;
+                }
+                batch = microbatch::next_batch(&mut rx, options.window) => {
+                    match batch {
+                        Some(batch) => {
+                            if let Err(err) = process_batch(batch, project_root.clone(), storage.clone(), ignore.clone()) {
+                                tracing::error!(error = %err, "failed to process batch");
+                            }
                         }
+                        None => break,
                     }
-                    None => break,
                 }
             }
         }
     }
+
+    #[cfg(not(unix))]
+    {
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        loop {
+            tokio::select! {
+                _ = &mut ctrl_c => {
+                    tracing::info!("SIGINT received, shutting down watcher");
+                    break;
+                }
+                batch = microbatch::next_batch(&mut rx, options.window) => {
+                    match batch {
+                        Some(batch) => {
+                            if let Err(err) = process_batch(batch, project_root.clone(), storage.clone(), ignore.clone()) {
+                                tracing::error!(error = %err, "failed to process batch");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
+    lock.release();
     Ok(())
 }
 

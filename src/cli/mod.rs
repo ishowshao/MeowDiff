@@ -1,4 +1,6 @@
+use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,7 +14,7 @@ use crate::pipeline::decompress_patch;
 use crate::runtime;
 use crate::storage::{find_project_entry, read_registry_global, StorageEngine};
 use crate::util;
-use crate::watcher::{self, WatchOptions};
+use crate::watcher::{self, is_process_alive, send_terminate, WatchLock, WatchOptions};
 
 #[derive(Parser)]
 #[command(author, version, about = "MeowDiff local change tracker")]
@@ -26,6 +28,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     Watch(WatchArgs),
+    Stop(StopArgs),
     Timeline(TimelineArgs),
     Show(ShowArgs),
     Diff(DiffArgs),
@@ -34,6 +37,7 @@ pub enum Commands {
     Projects(ProjectsArgs),
     Inspect(InspectArgs),
     Ignore(IgnoreArgs),
+    Extract(ExtractArgs),
 }
 
 #[derive(Args)]
@@ -46,6 +50,20 @@ pub struct WatchArgs {
         default_value_t = 50
     )]
     pub window_ms: u64,
+    #[arg(long, help = "Run watcher as background daemon")]
+    pub daemon: bool,
+    #[arg(long, hide = true)]
+    pub foreground: bool,
+}
+
+#[derive(Args)]
+pub struct StopArgs {
+    #[arg(short, long, help = "Project path (defaults to CWD when omitted)")]
+    pub path: Option<PathBuf>,
+    #[arg(long, help = "Specify project-id instead of path")]
+    pub project_id: Option<String>,
+    #[arg(long, help = "Remove stale lock even if process is not running")]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -76,6 +94,12 @@ pub struct DiffArgs {
     pub record_id: String,
     #[arg(short, long)]
     pub path: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
+    #[arg(long)]
+    pub stat: bool,
+    #[arg(long)]
+    pub file: Option<String>,
 }
 
 #[derive(Args)]
@@ -91,6 +115,8 @@ pub struct RestoreArgs {
 pub struct StatusArgs {
     #[arg(short, long)]
     pub path: Option<PathBuf>,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -136,11 +162,23 @@ pub struct IgnoreTestArgs {
     pub target: PathBuf,
 }
 
+#[derive(Args)]
+pub struct ExtractArgs {
+    pub record_id: String,
+    #[arg(short, long)]
+    pub path: Option<PathBuf>,
+    #[arg(long, value_name = "DIR")]
+    pub output: PathBuf,
+    #[arg(long)]
+    pub overwrite: bool,
+}
+
 pub async fn run_cli() -> Result<()> {
     let cli = Cli::parse();
     runtime::init_tracing(cli.verbose)?;
     match cli.command {
         Commands::Watch(args) => handle_watch(args).await,
+        Commands::Stop(args) => handle_stop(args),
         Commands::Timeline(args) => handle_timeline(args),
         Commands::Show(args) => handle_show(args),
         Commands::Diff(args) => handle_diff(args),
@@ -149,14 +187,43 @@ pub async fn run_cli() -> Result<()> {
         Commands::Projects(args) => handle_projects(args),
         Commands::Inspect(args) => handle_inspect(args),
         Commands::Ignore(args) => handle_ignore(args.command),
+        Commands::Extract(args) => handle_extract(args),
     }
 }
 
 async fn handle_watch(args: WatchArgs) -> Result<()> {
-    let project_root = util::resolve_project_root(args.path)?;
+    let WatchArgs {
+        path,
+        window_ms,
+        daemon,
+        foreground,
+    } = args;
+
+    let project_root = util::resolve_project_root(path.clone())?;
+    if daemon && !foreground {
+        let exe = std::env::current_exe().context("failed to resolve current executable")?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("watch")
+            .arg("--foreground")
+            .arg("--window-ms")
+            .arg(window_ms.to_string())
+            .arg("--path")
+            .arg(project_root.to_string_lossy().to_string());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = cmd.spawn().context("failed to spawn watcher daemon")?;
+        println!(
+            "Watcher daemon started (pid {}) for {}",
+            child.id(),
+            project_root.display()
+        );
+        return Ok(());
+    }
+
     let options = WatchOptions {
         project_root,
-        window: Duration::from_millis(args.window_ms),
+        window: Duration::from_millis(window_ms),
     };
     watcher::watch(options).await
 }
@@ -206,9 +273,47 @@ fn handle_show(args: ShowArgs) -> Result<()> {
 }
 
 fn handle_diff(args: DiffArgs) -> Result<()> {
-    let storage = open_storage(args.path)?;
-    let compressed = storage.read_patch(&args.record_id)?;
-    let patch = decompress_patch(&compressed)?;
+    let DiffArgs {
+        record_id,
+        path,
+        json,
+        stat,
+        file,
+    } = args;
+
+    let storage = open_storage(path)?;
+    let meta = storage.read_record_meta(&record_id)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&meta.files)?);
+        return Ok(());
+    }
+
+    if stat {
+        println!("Diff summary for record {}:", record_id);
+        for entry in &meta.files {
+            println!(
+                "  - {:<40} {:>5} added {:>5} removed",
+                entry.path, entry.stats.added, entry.stats.removed
+            );
+        }
+        println!(
+            "Totals: files={} +{} -{}",
+            meta.stats.files, meta.stats.lines_added, meta.stats.lines_removed
+        );
+        return Ok(());
+    }
+
+    let compressed = storage.read_patch(&record_id)?;
+    let mut patch = decompress_patch(&compressed)?;
+    if let Some(filter) = file {
+        patch = filter_patch_for_file(&patch, &filter);
+        if patch.trim().is_empty() {
+            println!("No diff found for {} in record {}", filter, record_id);
+            return Ok(());
+        }
+    }
+
     println!("{}", patch);
     Ok(())
 }
@@ -254,21 +359,115 @@ fn handle_restore(args: RestoreArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_status(args: StatusArgs) -> Result<()> {
-    let storage = open_storage(args.path)?;
-    let latest = storage.latest_record_id()?;
-    println!("Project: {}", storage.project_id());
-    println!("Root: {}", storage.project_root().display());
-    match latest {
-        Some(id) => {
-            let meta = storage.read_record_meta(&id)?;
-            println!(
-                "Last record: {} at {} ({} files)",
-                id, meta.ended_at, meta.stats.files
-            );
+fn handle_stop(args: StopArgs) -> Result<()> {
+    let StopArgs {
+        path,
+        project_id,
+        force,
+    } = args;
+
+    let (project_id, meta_dir) = if let Some(path) = path {
+        let root = util::resolve_project_root(Some(path))?;
+        let project_id = util::compute_project_id(&root)?;
+        let meta_dir = util::meowdiff_root()?.join(&project_id).join("meta");
+        (project_id, meta_dir)
+    } else if let Some(requested_id) = project_id {
+        let entry = find_project_entry(&requested_id)?
+            .ok_or_else(|| anyhow!("project {requested_id} not found in registry"))?;
+        let meta_dir = util::meowdiff_root()?.join(&entry.project_id).join("meta");
+        (entry.project_id, meta_dir)
+    } else {
+        let root = util::resolve_project_root(None)?;
+        let project_id = util::compute_project_id(&root)?;
+        let meta_dir = util::meowdiff_root()?.join(&project_id).join("meta");
+        (project_id, meta_dir)
+    };
+
+    let lock_info = match WatchLock::read(&meta_dir)? {
+        Some(info) => info,
+        None => {
+            println!("No active watcher for project {project_id}");
+            return Ok(());
         }
-        None => println!("No records yet"),
+    };
+
+    if is_process_alive(lock_info.pid) {
+        send_terminate(lock_info.pid)?;
+        println!("Sent SIGTERM to watcher pid {}", lock_info.pid);
+    } else if !force {
+        println!(
+            "Watcher process {} not running; use --force to clear lock",
+            lock_info.pid
+        );
+        return Ok(());
+    } else {
+        println!("Removing stale lock for project {project_id}");
     }
+
+    let lock_path = WatchLock::path(&meta_dir);
+    fs::remove_file(&lock_path).ok();
+    println!("Stopped watcher for project {project_id}");
+    Ok(())
+}
+
+fn handle_status(args: StatusArgs) -> Result<()> {
+    let StatusArgs { path, json } = args;
+    let storage = open_storage(path)?;
+    let latest = storage.latest_record_id()?;
+    let latest_meta = if let Some(ref id) = latest {
+        Some(storage.read_record_meta(id)?)
+    } else {
+        None
+    };
+    let meta_dir = storage.paths().meta_dir.clone();
+    let lock = WatchLock::read(&meta_dir)?;
+    let watching = lock
+        .as_ref()
+        .map(|info| is_process_alive(info.pid))
+        .unwrap_or(false);
+
+    if json {
+        let payload = json!({
+            "project_id": storage.project_id(),
+            "root": storage.project_root().to_string_lossy(),
+            "watcher": {
+                "active": watching,
+                "lock": lock.clone(),
+            },
+            "latest_record": latest_meta.as_ref().map(|meta| json!({
+                "record_id": meta.record_id,
+                "ended_at": meta.ended_at,
+                "files": meta.stats.files,
+                "lines_added": meta.stats.lines_added,
+                "lines_removed": meta.stats.lines_removed,
+            })),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("Project: {}", storage.project_id());
+        println!("Root: {}", storage.project_root().display());
+        match &lock {
+            Some(info) if watching => println!(
+                "Watcher running (pid {}) since {}",
+                info.pid, info.started_at
+            ),
+            Some(info) => println!("Watcher lock present but process {} not running", info.pid),
+            None => println!("Watcher: inactive"),
+        }
+        if let Some(meta) = latest_meta {
+            println!(
+                "Last record: {} at {} (files: {}, +{}, -{})",
+                meta.record_id,
+                meta.ended_at,
+                meta.stats.files,
+                meta.stats.lines_added,
+                meta.stats.lines_removed
+            );
+        } else {
+            println!("No records yet");
+        }
+    }
+
     Ok(())
 }
 
@@ -357,6 +556,41 @@ fn handle_ignore(cmd: IgnoreCommands) -> Result<()> {
     }
 }
 
+fn handle_extract(args: ExtractArgs) -> Result<()> {
+    let ExtractArgs {
+        record_id,
+        path,
+        output,
+        overwrite,
+    } = args;
+
+    let storage = open_storage(path)?;
+    let meta = storage.read_record_meta(&record_id)?;
+    util::ensure_dir(&output)?;
+
+    for file in &meta.files {
+        let Some(ref sha) = file.after_sha else {
+            continue;
+        };
+        let data = storage.read_blob(sha)?;
+        let dest = output.join(&file.path);
+        if dest.exists() && !overwrite {
+            bail!(
+                "{} already exists; use --overwrite to replace",
+                dest.display()
+            );
+        }
+        if let Some(parent) = dest.parent() {
+            util::ensure_dir(parent)?;
+        }
+        fs::write(&dest, data)
+            .with_context(|| format!("failed to write extracted file {}", dest.display()))?;
+    }
+
+    println!("Extracted record {} to {}", record_id, output.display());
+    Ok(())
+}
+
 fn open_storage(path: Option<PathBuf>) -> Result<StorageEngine> {
     let root = util::resolve_project_root(path)?;
     StorageEngine::open(&root)
@@ -383,4 +617,14 @@ fn print_timeline(entries: &[TimelineEntry]) {
             entry.lines_removed
         );
     }
+}
+
+fn filter_patch_for_file(patch: &str, file: &str) -> String {
+    let needle_a = format!("a/{file}");
+    let needle_b = format!("b/{file}");
+    patch
+        .split("\n\n")
+        .filter(|section| section.contains(&needle_a) || section.contains(&needle_b))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
