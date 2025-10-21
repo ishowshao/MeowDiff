@@ -168,6 +168,15 @@ fn process_batch(
         }
         patch.push('\n');
     }
+
+    if !patch.trim().is_empty() {
+        println!(
+            "record {} (files: {}, +{}, -{})",
+            record_id, meta.stats.files, meta.stats.lines_added, meta.stats.lines_removed
+        );
+        print!("{}", patch);
+    }
+
     let compressed_patch = compress_patch(&patch)?;
     storage.commit_record(&meta, &compressed_patch, &artifacts)?;
     storage.register_touch()?;

@@ -40,9 +40,13 @@ impl IgnoreMatcher {
         }
         let custom = project_root.join(".meowdiffignore");
         if custom.exists() {
-            builder
-                .add(custom.as_path())
-                .with_context(|| format!("failed to parse {}", custom.display()))?;
+            if let Some(err) = builder.add(custom.as_path()) {
+                return Err(anyhow::anyhow!(
+                    "failed to parse {}: {}",
+                    custom.display(),
+                    err
+                ));
+            }
             rules.push(format!("(file) {}", custom.display()));
         }
         let matcher = builder
